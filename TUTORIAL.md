@@ -11,7 +11,7 @@
 
 You don't need to know LangGraph. You should know basic Python (functions, dictionaries, lists).
 Each section explains **one idea**, shows **the real code** from the notebook, and ends with a **"check yourself"** question.
-Keep the notebook open beside you; the section numbers in brackets, like *(Notebook §5)*, tell you where to look.
+Keep the notebook open beside you; the section numbers in brackets, like *(Notebook §4)*, tell you where to look.
 
 | Part | You will learn |
 |---|---|
@@ -138,7 +138,7 @@ This is the most important idea in LangGraph.
 
 Imagine a **file folder** moving from desk to desk in an accounts office.
 Each desk reads the folder, does **one** job, and adds a note. In LangGraph that folder is the **State**:
-one Python dictionary, with its shape declared up front *(Notebook §5)*:
+one Python dictionary, with its shape declared up front *(Notebook §4)*:
 
 ```python
 class PaymentState(TypedDict):
@@ -162,13 +162,13 @@ class PaymentState(TypedDict):
 A node never returns the whole folder. It returns **only the keys it changed**. That small dictionary is the **delta**.
 
 ```python
+def report(check_name, flags):
+    # the delta every check returns: just 2 keys
+    return {"risk_flags": flags, "audit_log": [f"{check_name}: {', '.join(flags) or 'clean'}"]}
+
 def check_bank_change(state):
-    invoice, vendor = state["invoice"], state["vendor"]
-    flags = []
-    if invoice.get("bank_account") != vendor.get("bank_account"):
-        flags.append("BANK_DETAILS_CHANGED")
-    return {"risk_flags": flags,                                     # <- the delta: 2 keys only
-            "audit_log": [f"check_bank_change: {', '.join(flags) or 'clean'}"]}
+    changed = state["invoice"]["bank_account"] != state["vendor"]["bank_account"]
+    return report("check_bank_change", ["BANK_DETAILS_CHANGED"] if changed else [])
 ```
 
 LangGraph then **merges** the delta into the State. *How* it merges is decided by the **reducer**.
@@ -202,8 +202,7 @@ With the reducer, LangGraph joins the four lists. Then `risk_scorer` sees **all*
 It can't choose, so it stops. The notebook proves this *(Notebook §9)* by building a copy of the graph with a plain `risk_flags: list[str]`:
 
 ```
-❌ InvalidUpdateError
-At key 'risk_flags': Can receive only one value per step. Use an Annotated key to handle multiple values.
+InvalidUpdateError: At key 'risk_flags': Can receive only one value per step. Use an Annotated key to handle multiple values.
 ```
 
 > **Rule:** if two or more nodes can write the same key in the same step, that key **needs a reducer**.
@@ -233,7 +232,7 @@ At the end of a run we have the complete story of what the agent did, which is e
 
 ### 5.2 Tools: how the agent finds things out
 
-The agent doesn't "know" our vendors or purchase orders. It **calls small functions**, called **tools**, to look them up *(Notebook §4)*:
+The agent doesn't "know" our vendors or purchase orders. It **calls small functions**, called **tools**, to look them up *(Notebook §3)*:
 
 | Tool | Question it answers |
 |---|---|
@@ -248,16 +247,15 @@ Example: the PO check calls two tools and turns the answers into flags.
 
 ```python
 def check_po_match(state):
-    invoice, vendor = state["invoice"], state["vendor"]
+    invoice = state["invoice"]
+    po = find_purchase_order(invoice["po_number"])                     # TOOL CALL
+    if po is None or po["vendor_id"] != state["vendor"]["vendor_id"]:
+        return report("check_po_match", ["NO_MATCHING_PO"])
     flags = []
-    po = find_purchase_order(invoice.get("po_number"))                 # TOOL CALL
-    if po is None or po["vendor_id"] != vendor.get("vendor_id"):
-        flags.append("NO_MATCHING_PO")
-    else:
-        if invoice["amount"] > po["amount"]:
-            flags.append("AMOUNT_EXCEEDS_PO")
-        if find_goods_receipt(invoice["po_number"]) is None:           # TOOL CALL
-            flags.append("GOODS_NOT_RECEIVED")
+    if invoice["amount"] > po["amount"]:
+        flags.append("AMOUNT_EXCEEDS_PO")
+    if find_goods_receipt(invoice["po_number"]) is None:               # TOOL CALL
+        flags.append("GOODS_NOT_RECEIVED")
     return report("check_po_match", flags)
 ```
 
@@ -268,14 +266,13 @@ There's a second kind of function calling in this project, where **the LLM** cal
 ## 6. Conditional routing: who goes where?
 
 A plain edge always goes to the same place. A **conditional edge** asks a **router** function where to go next.
-A router reads the State and **returns the name of the next node**. It **never changes** the State *(Notebook §6, "Routers")*.
+A router reads the State and **returns the name of the next node**. It **never changes** the State *(Notebook §6)*.
 
 ```python
 def route_by_score(state):
-    score = state["risk_score"]
-    if score < APPROVE_BELOW:        # 30
+    if state["risk_score"] < APPROVE_BELOW:     # 30
         return "approve"
-    if score >= BLOCK_FROM:          # 80
+    if state["risk_score"] >= BLOCK_FROM:       # 80
         return "block"
     return "callback_vendor"
 
@@ -356,10 +353,9 @@ So a limit of 20 never gets in the way, but still stops a runaway loop.
 The notebook builds a tiny graph whose router **forgets** to count *(Notebook §10)*:
 
 ```python
-def route_after_call_NO_GUARD(state):
-    if state["vendor_response"] == "no_answer":
-        return "callback_vendor"          # no MAX_CALLS check!
-    return END
+def route_after_call_no_guard(state):
+    # no MAX_CALLS check!
+    return "callback_vendor" if state["vendor_response"] == "no_answer" else END
 ```
 
 Running it on Rao (with a small limit of 6):
@@ -370,7 +366,7 @@ callback_vendor: call #2 to +91-90000-10004 -> no_answer
 ...
 callback_vendor: call #6 to +91-90000-10004 -> no_answer
 
-🛑 GraphRecursionError: Recursion limit of 6 reached without hitting a stop condition.
+GraphRecursionError: Recursion limit of 6 reached without hitting a stop condition.
 ```
 
 > **Lesson:** every cycle needs an exit condition **stored in the State** (guard #1),
@@ -439,7 +435,7 @@ The notebook runs all 7 test invoices and draws the **same graph seven times**, 
 | 7 | PO and amount missing | validate → reject | ❌ REJECTED |
 
 The notebook also checks itself: an `EXPECTED` table lists the decision each invoice *should* get,
-and the summary marks each row ✅ or ❌ *(Notebook §8)*. All 7 pass.
+and the summary table has an `as expected` column *(Notebook §8)*. All 7 are `True`.
 
 ---
 
@@ -540,7 +536,7 @@ All the rules are constants at the top of the notebook *(Notebook §1)*. Change 
        return report("check_high_value", flags)
    ```
    Then: add `"HIGH_VALUE": 30` to `RISK_POINTS`, add `"check_high_value"` to `CHECKS`,
-   `builder.add_node("check_high_value", check_high_value)`, and give it a spot in `POSITIONS` for the drawing.
+   add `check_high_value` to the list of functions passed to `builder.add_node` (§7), and give it a spot in `POSITIONS` for the drawing.
    *Prediction:* invoice 1 (₹4,50,000) now scores 30 and goes to `callback_vendor`. Sharma Steel isn't in
    `CALLBACK_SCRIPT`, so nobody answers and it's blocked after 3 calls. Add `"+91-90000-10001": ["confirmed"]` to the script
    and it's approved instead. The fan-out and join work automatically because they use the `CHECKS` list,
