@@ -294,7 +294,7 @@ We build in small layers. **This is also how you rebuild it from memory in the v
 |---|---|---|
 | 0 ✅ | Environment: `.venv`, install `langgraph`, `ipykernel`, `matplotlib`, `networkx`, `grandalf`, `ollama`, `pandas` | setup |
 | 1 ✅ | Settings + mock data + 7 test invoices + tools (plain Python, no LangGraph yet) | the business problem and data |
-| 2 | State + `read_invoice` → `validate` → `END` (a straight line) | what state and nodes are |
+| 2 ✅ | State + `read_invoice` → `validate` → `END` (a straight line) | what state and nodes are |
 | 3 | 4 check nodes in parallel + `risk_flags` reducer + scorer | **the reducer pattern** |
 | 4 | Conditional routing: approve / callback / block / reject | routing |
 | 5 | Callback loop + `call_attempts` guard + `recursion_limit` | **loops and infinite loops** |
