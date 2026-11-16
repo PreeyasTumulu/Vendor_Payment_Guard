@@ -59,19 +59,25 @@ Raw invoice text (like an email body)
             │
      [read_invoice] node
             │
-   ┌────────┴─────────┐
- USE_LLM = True     USE_LLM = False
- Local LLM          Simple Python parser
- (Ollama, qwen3)    (splits "Field: value" lines)
-   └────────┬─────────┘
-            ▼
- Clean invoice dict: {invoice_no, vendor_id, po_number, amount, gstin, bank_account}
+   1. Simple parser (always first, exact, instant)
+            │
+   all 6 fields found? ── yes ──────────────────────────────┐
+            │ no, and USE_LLM = True                        │
+   2. Local LLM (Ollama, qwen3:4b-instruct) reads the text  │
+      by CALLING the tool submit_invoice_fields(...)        │
+            │                                               │
+   3. VERIFY: keep an LLM value only if it appears          │
+      word-for-word in the invoice text                     │
+            ▼                                               ▼
+ Invoice dict: {invoice_no, vendor, po_number, amount, gstin, bank_account}
+ (Ollama off → parser result only; missing fields → validate rejects)
 ```
 
-- **Midterm version:** invoices are plain text in a fixed template. The simple parser always works.
-  The LLM path shows real "function calling" and handles messy text.
-- **If the LLM gets a field wrong**, the next node (`validate`) catches missing or invalid fields and rejects the invoice.
-  We treat LLM output as **untrusted input**. That's another good viva point.
+- **Why parser first + verification (built in Step 7, based on a real test):** the local LLM read messy emails well,
+  but on our test invoices it sometimes **copied values wrongly** (`PO-1001` → `PO-10_001`, one digit changed in a
+  bank account). So the LLM only fills gaps, and anything not found in the source text is thrown away.
+- **Demo:** a messy email invoice is REJECTED with the parser alone and APPROVED with the LLM. Same graph, same rules.
+- The LLM never makes the approve/block decision. **"The LLM reads, the rules decide."**
 - **Product version (later):** read PDFs (`pdfplumber`), watch an email inbox, import from Tally.
 
 ---
@@ -243,6 +249,7 @@ Vendor_Payment_Guard/
 ├── TUTORIAL.md                  ← beginner tutorial (exported to PDF)
 ├── TUTORIAL.pdf                 ← LMS FILE 2
 ├── requirements.txt
+├── scripts/make_tutorial_pdf.py ← rebuilds TUTORIAL.pdf (pandoc + Edge)
 ├── assets/                      ← diagrams/screenshots used by README and TUTORIAL
 └── videos/
     └── SCRIPTS.md               ← scripts for the tutorial videos
@@ -295,12 +302,12 @@ We build in small layers. **This is also how you rebuild it from memory in the v
 | 0 ✅ | Environment: `.venv`, install `langgraph`, `ipykernel`, `matplotlib`, `networkx`, `grandalf`, `ollama`, `pandas` | setup |
 | 1 ✅ | Settings + mock data + 7 test invoices + tools (plain Python, no LangGraph yet) | the business problem and data |
 | 2 ✅ | State + `read_invoice` → `validate` → `END` (a straight line) | what state and nodes are |
-| 3 | 4 check nodes in parallel + `risk_flags` reducer + scorer | **the reducer pattern** |
-| 4 | Conditional routing: approve / callback / block / reject | routing |
-| 5 | Callback loop + `call_attempts` guard + `recursion_limit` | **loops and infinite loops** |
-| 6 | Visuals: ASCII graph, highlighted paths, delta trace table, summary | **visual traceability, delta tracing** |
-| 7 | Optional: local LLM reader with tool calling (`USE_LLM` switch) | function calling with an LLM |
-| 8 | README with diagrams + TUTORIAL.md + PDF export | architecture write-up |
+| 3 ✅ | 4 check nodes in parallel + `risk_flags` reducer + scorer | **the reducer pattern** |
+| 4 ✅ | Conditional routing: approve / callback / block / reject | routing |
+| 5 ✅ | Callback loop + `call_attempts` guard + `recursion_limit` | **loops and infinite loops** |
+| 6 ✅ | Visuals: ASCII graph, highlighted paths, delta trace table, summary | **visual traceability, delta tracing** |
+| 7 ✅ | Local LLM reader with tool calling (`USE_LLM` switch) | function calling with an LLM |
+| 8 ✅ | README with diagrams + TUTORIAL.md + PDF export | architecture write-up |
 | 9 | Video scripts + viva rehearsal questions | defense |
 
 **Code-simplicity rules we'll follow:**
