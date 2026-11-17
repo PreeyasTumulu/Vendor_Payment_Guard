@@ -1,165 +1,125 @@
-# Building a Stateful AI Agent with LangGraph
+# Building a stateful agent with LangGraph
 
-### A beginner's tutorial: *Vendor Payment Guard*, a local agent that stops invoice fraud
+A beginner's tutorial based on Vendor Payment Guard, a local agent that checks vendor invoices for fraud.
 
-**Course:** Agentic AI (STAI343) · Mid-term project
-**Code:** `vendor_payment_guard.ipynb` (runs fully offline)
+Agentic AI (STAI343), midterm project. The code is in `vendor_payment_guard.ipynb` and runs offline.
 
----
+## Before you start
 
-## How to use this tutorial
+You don't need to know LangGraph, but you should be comfortable with basic Python: functions, dictionaries and lists.
+Each section covers one idea and shows the actual code from the notebook. References like *(notebook §4)* point to the
+matching section of the notebook, so it helps to have it open alongside this.
 
-You don't need to know LangGraph. You should know basic Python (functions, dictionaries, lists).
-Each section explains **one idea**, shows **the real code** from the notebook, and ends with a **"check yourself"** question.
-Keep the notebook open beside you; the section numbers in brackets, like *(Notebook §4)*, tell you where to look.
+The parts the assignment asks to focus on are the reducer pattern (section 4), loops and how to stop them running
+forever (section 7), tracing the delta (section 8) and diagrams of the agent's behaviour (section 9).
 
-| Part | You will learn |
-|---|---|
-| 1–2 | The problem, and why a chatbot can't solve it |
-| 3 | The whole architecture at a glance |
-| 4 | **State, delta and the reducer pattern** |
-| 5 | Nodes and tools (function calling) |
-| 6 | Conditional routing |
-| 7 | **Loops, and how to stop infinite loops** |
-| 8 | **Tracing the delta, step by step** |
-| 9 | **The agent's behaviour, in diagrams** |
-| 10 | The local LLM: reading messy invoices safely |
-| 11 | Edge cases |
-| 12 | Try it yourself |
-| 13 | Glossary |
+## 1. The problem
 
----
+Shakti Auto Components is a small factory in Pune that buys steel from Sharma Steel Traders. One morning the accounts
+team gets this email:
 
-## 1. The problem: the ₹2 crore email
+> Dear team, please find invoice SST/2026/0412 for PO-1001, ₹4,50,000. Note: we have changed our bank.
+> Kindly pay to A/c 99887766554.
 
-Shakti Auto Components, a small factory in Pune, buys steel from *Sharma Steel Traders*.
-One morning, accounts receives this:
+The PO number is real and the amount is right, but Sharma Steel never sent it. Someone got into their email, or made a
+convincing copy of it, and changed the bank account to their own. This kind of invoice fraud is common enough to have a
+name, business email compromise, and it has cost Indian companies ₹2 crore (Chennai) and ₹2.35 crore (Pune) in
+reported cases.
 
-> *"Dear team, please find invoice SST/2026/0412 for PO-1001, ₹4,50,000. Note: we have changed our bank.
-> Kindly pay to A/c 99887766554."*
+A careful accountant would check that the invoice hasn't been paid already, that it matches a real purchase order, that
+the goods actually arrived, and that the bank account and GST number match what's on record. If anything looked off,
+they would phone the supplier on the number they already have, not the one in the email, and only then decide whether
+to pay. The agent in this project does the same thing for every invoice.
 
-It looks real. The PO number is real. The amount is right. But **Sharma Steel never sent it**.
-A fraudster hacked (or copied) their email and changed one thing: the bank account.
-
-This is **vendor / invoice fraud**, also called *Business Email Compromise*. Real Indian cases:
-a Chennai businessman lost **₹2 crore**, and a Pune auto-parts firm lost **₹2.35 crore**.
-
-**What a careful accountant would do:**
-
-1. Check we haven't already paid this invoice.
-2. Check it matches a real purchase order and that the goods arrived.
-3. Check the bank account against **our own** records.
-4. Check the GST number.
-5. If anything is off, **phone the vendor on the number we already have**, not the one in the email.
-6. Then decide: pay, investigate, or refuse.
-
-Our agent does exactly this, every time, without getting tired.
-
-> **Check yourself:** Why must the agent phone the number from *our* records and not the one on the invoice?
-> *(Because the fraudster controls the invoice. They can't change our vendor master.)*
-
----
+*Quick check: why does the agent call the number from our records instead of the one on the invoice? Because whoever
+sent a fake invoice controls everything written on it, but not our vendor records.*
 
 ## 2. Why not just use a chatbot?
 
-A normal LLM chat is **stateless**: each message is answered on its own, and the model may answer differently each time.
-That's fine for conversation, but terrible for money:
+A chat model on its own is stateless. It answers each message separately, it can give different answers to the same
+question, and it doesn't keep track of what has already happened. That's fine for conversation but not for deciding
+whether to release a payment, where you want the same invoice to get the same decision every time, and you want to be
+able to explain why.
 
-| Need | Stateless chatbot | Our state machine |
-|---|---|---|
-| Remember what already happened (e.g. "we called twice") | ❌ forgets | ✅ stored in the **State** |
-| Same input → same decision | ❌ can vary | ✅ **deterministic** rules |
-| Explain every decision | ❌ hard | ✅ an **audit log** line from every step |
-| Run checks in parallel, retry, stop safely | ❌ | ✅ **graph** of nodes, edges, loops |
+So instead the agent is built as a state machine: a fixed set of steps (nodes) joined by arrows (edges), with a shared
+record (the state) that is passed from step to step. It can remember things like how many times it has phoned a vendor,
+run checks in parallel, retry, and keep a log of every step. LangGraph is the Python library that runs it.
 
-So we build a **state machine**: a fixed set of steps (nodes) connected by arrows (edges),
-with a shared memory (state) that moves between them. **LangGraph** is the Python library that runs it.
-
-> **Check yourself:** What does "deterministic" mean, and why does it matter for payments?
-
----
-
-## 3. The architecture at a glance
+## 3. The architecture
 
 ```mermaid
 flowchart TD
-    START([Invoice text arrives]) --> READ["read_invoice"]
-    READ --> VALIDATE["validate"]
-    VALIDATE -->|"incomplete / unknown vendor"| REJECT["reject"]
+    START([Invoice text arrives]) --> READ[read_invoice]
+    READ --> VALIDATE[validate]
+    VALIDATE -->|"incomplete or unknown vendor"| REJECT[reject]
     VALIDATE -->|"ok"| DUP[check_duplicate]
     VALIDATE --> PO[check_po_match]
     VALIDATE --> BANK[check_bank_change]
     VALIDATE --> GST[check_gstin]
-    DUP --> SCORE["risk_scorer"]
+    DUP --> SCORE[risk_scorer]
     PO --> SCORE
     BANK --> SCORE
     GST --> SCORE
-    SCORE -->|"below 30"| APPROVE["approve"]
-    SCORE -->|"30 to 79"| CALL["callback_vendor"]
-    SCORE -->|"80+"| BLOCK["block"]
+    SCORE -->|"below 30"| APPROVE[approve]
+    SCORE -->|"30 to 79"| CALL[callback_vendor]
+    SCORE -->|"80+"| BLOCK[block]
     CALL -->|"confirmed"| APPROVE
     CALL -->|"denied"| BLOCK
-    CALL -->|"no answer, calls below 3"| CALL
+    CALL -->|"no answer, under 3 calls"| CALL
     CALL -->|"no answer, 3 calls"| BLOCK
     APPROVE --> END([END])
     BLOCK --> END
     REJECT --> END
 ```
 
-Read it top to bottom:
+Reading it from the top: `read_invoice` turns the text into six fields and `validate` makes sure the invoice can be
+checked at all. If it can't, it goes to `reject`. Otherwise four checks run at the same time, each one raising warning
+flags if it finds something. `risk_scorer` waits for all four, adds up the points, and the total decides whether the
+invoice is approved, blocked, or sent to `callback_vendor`, which can loop back to itself up to three times if the
+vendor doesn't answer.
 
-1. **`read_invoice`** turns the invoice text into 6 fields.
-2. **`validate`** checks that the invoice can be checked at all. If not → **`reject`**.
-3. **Four checks run at the same time** (*fan-out*). Each one can raise warning **flags**.
-4. **`risk_scorer`** waits for all four (*join*) and adds up the points.
-5. The **score decides the route**: approve, call the vendor, or block.
-6. **`callback_vendor`** can **loop back to itself** if the vendor doesn't answer, up to 3 times.
+The notebook draws the same graph from the compiled LangGraph object *(notebook §11.1)*:
 
-This picture is generated by the notebook from the real compiled graph *(Notebook §11.1)*:
+![The compiled graph](assets/architecture.png)
 
-![The compiled graph, drawn by the code](assets/architecture.png)
-
-**The 4 moves to build any LangGraph agent** *(Notebook §7)*:
+Building any LangGraph agent comes down to four calls *(notebook §7)*:
 
 ```python
-builder = StateGraph(PaymentState)            # 1. a graph that carries our State
-builder.add_node("validate", validate)        # 2. register each node (a Python function)
-builder.add_edge("read_invoice", "validate")  # 3. connect them with edges
-graph = builder.compile()                     # 4. turn the blueprint into a runnable agent
+builder = StateGraph(PaymentState)            # a graph that carries our state
+builder.add_node(validate)                    # register a function as a node (named after the function)
+builder.add_edge("read_invoice", "validate")  # connect two nodes
+graph = builder.compile()                     # turn it into something you can run
 ```
 
----
+## 4. State, deltas and the reducer pattern
 
-## 4. State, delta and the reducer pattern ⭐
+### The state
 
-This is the most important idea in LangGraph.
-
-### 4.1 The State is a shared folder
-
-Imagine a **file folder** moving from desk to desk in an accounts office.
-Each desk reads the folder, does **one** job, and adds a note. In LangGraph that folder is the **State**:
-one Python dictionary, with its shape declared up front *(Notebook §4)*:
+The state is one Python dictionary that every node can read. A good way to picture it is a file folder that moves from
+desk to desk in an office: each desk does its one job and adds a note before passing it on. Its shape is declared up
+front *(notebook §4)*:
 
 ```python
 class PaymentState(TypedDict):
-    raw_text: str          # the invoice text (input)
-    invoice: dict          # the 6 fields read from it
-    vendor: dict           # OUR trusted record of this vendor
-    errors: list[str]      # why it can't be checked (if any)
+    raw_text: str          # the invoice as received
+    invoice: dict          # invoice_no, vendor, po_number, amount, gstin, bank_account
+    vendor: dict           # our own record of this vendor
+    errors: list[str]      # why the invoice can't be checked, if anything
 
-    risk_flags: Annotated[list[str], operator.add]   # warnings from the checks  -> REDUCER: append
+    risk_flags: Annotated[list[str], operator.add]   # appended to, not replaced
     risk_score: int
-    call_attempts: int     # the LOOP COUNTER
+    call_attempts: int     # loop counter
     vendor_response: str
     decision: str          # APPROVED / BLOCKED / REJECTED
     reason: str
 
-    audit_log: Annotated[list[str], operator.add]    # one line per node          -> REDUCER: append
+    audit_log: Annotated[list[str], operator.add]    # one line per node
 ```
 
-### 4.2 A node returns only a delta
+### Nodes return deltas
 
-A node never returns the whole folder. It returns **only the keys it changed**. That small dictionary is the **delta**.
+A node never returns the whole state, only the keys it changed. That small dictionary is called the delta. Every check
+in this project returns its delta through a small helper:
 
 ```python
 def report(check_name, flags):
@@ -171,102 +131,80 @@ def check_bank_change(state):
     return report("check_bank_change", ["BANK_DETAILS_CHANGED"] if changed else [])
 ```
 
-LangGraph then **merges** the delta into the State. *How* it merges is decided by the **reducer**.
+LangGraph then merges the delta into the state. How it merges each key depends on that key's reducer.
 
-### 4.3 The reducer: the merge rule
+### Reducers
 
-| How the field is declared | Reducer | What happens when a node returns `{"key": new}` |
-|---|---|---|
-| `risk_score: int` | none (default) | **replace**: `state["risk_score"] = new` |
-| `risk_flags: Annotated[list, operator.add]` | `operator.add` | **append**: `state["risk_flags"] = old + new` |
+A plain field like `risk_score: int` has no reducer, so a new value simply replaces the old one. A field declared as
+`Annotated[list, operator.add]` uses `operator.add` as its reducer, which for lists means `old + new`: the new items are
+appended.
 
-`operator.add` on two lists is just `old + new`, i.e. joining them.
-
-### 4.4 Why we *need* a reducer: parallel writes
-
-Our four checks run **in the same step**, in parallel, and **all four write `risk_flags`**.
-For invoice 6 (fake GSTIN + new bank account):
+The reason this matters here is that the four checks run in the same step and all of them write `risk_flags`. For
+invoice 6 (fake GSTIN and a new bank account) they return four separate lists:
 
 ```mermaid
 flowchart LR
-    A["check_duplicate<br/>returns []"] --> R(("reducer<br/>operator.add"))
+    A["check_duplicate<br/>returns []"] --> R(("operator.add"))
     B["check_po_match<br/>returns []"] --> R
     C["check_bank_change<br/>returns ['BANK_DETAILS_CHANGED']"] --> R
     D["check_gstin<br/>returns ['INVALID_GSTIN']"] --> R
-    R --> S["State.risk_flags =<br/>['BANK_DETAILS_CHANGED', 'INVALID_GSTIN']"]
+    R --> S["risk_flags =<br/>['BANK_DETAILS_CHANGED', 'INVALID_GSTIN']"]
 ```
 
-With the reducer, LangGraph joins the four lists. Then `risk_scorer` sees **all** the flags and scores 50 + 40 = **90**.
-
-**What if there were no reducer?** Then LangGraph would have to *replace* `risk_flags`, but with which of the four values?
-It can't choose, so it stops. The notebook proves this *(Notebook §9)* by building a copy of the graph with a plain `risk_flags: list[str]`:
+With the reducer, LangGraph joins them and `risk_scorer` sees both flags, scoring 50 + 40 = 90. Without it, LangGraph
+would have to pick one of the four values to keep, which it refuses to do. The notebook shows this by building the same
+four checks into a graph whose state has a plain `risk_flags: list[str]` *(notebook §9)*:
 
 ```
 InvalidUpdateError: At key 'risk_flags': Can receive only one value per step. Use an Annotated key to handle multiple values.
 ```
 
-> **Rule:** if two or more nodes can write the same key in the same step, that key **needs a reducer**.
+The general rule: if more than one node can write the same key in the same step, that key needs a reducer.
 
-### 4.5 The second reducer: `audit_log`
+`audit_log` uses `operator.add` for a different reason. Every node adds a line to it, and appending means none of those
+lines are lost, so at the end of a run there's a complete record of what the agent did.
 
-`audit_log` also uses `operator.add`, so every node *adds* one line and nothing is lost.
-At the end of a run we have the complete story of what the agent did, which is exactly what an auditor wants.
+*Quick check: `call_attempts` has no reducer. Why is replacing the right behaviour for it? Only one node writes it, and
+it always writes the new total (1, then 2, then 3).*
 
-> **Check yourself:** `call_attempts` has **no** reducer. Why is "replace" the right rule for it?
-> *(Only one node writes it, once per step, and it writes the new total: 1, then 2, then 3.)*
+## 5. Nodes and tools
 
----
-
-## 5. Nodes and tools (function calling)
-
-### 5.1 Nodes: one job each
-
-| # | Node | Job |
-|---|---|---|
-| 1 | `read_invoice` | text → 6 fields |
-| 2 | `validate` | fields present? vendor known? |
-| 3–6 | `check_duplicate`, `check_po_match`, `check_bank_change`, `check_gstin` | the four guards |
-| 7 | `risk_scorer` | flags → one number |
-| 8 | `callback_vendor` | phone the vendor (simulated) |
-| 9–11 | `approve`, `block`, `reject` | final decision + reason |
-
-### 5.2 Tools: how the agent finds things out
-
-The agent doesn't "know" our vendors or purchase orders. It **calls small functions**, called **tools**, to look them up *(Notebook §3)*:
-
-| Tool | Question it answers |
+| Node | What it does |
 |---|---|
-| `find_vendor(name)` | Is this vendor in our master? |
-| `find_purchase_order(po_number)` | Did we order this, for how much? |
-| `find_goods_receipt(po_number)` | Did the goods arrive? |
-| `is_already_paid(vendor_id, invoice_no)` | Have we paid this before? |
-| `is_valid_gstin_format(gstin)` | Is the GSTIN a valid 15-character code? |
-| `call_vendor(phone, attempt)` | What did the vendor say on this call? *(scripted, so runs are repeatable)* |
+| `read_invoice` | turns the text into six fields |
+| `validate` | checks the fields are present and the vendor is known |
+| `check_duplicate`, `check_po_match`, `check_bank_change`, `check_gstin` | the four checks |
+| `risk_scorer` | adds up the points for all flags |
+| `callback_vendor` | phones the vendor (simulated) and counts the call |
+| `approve`, `block`, `reject` | record the final decision and the reason |
 
-Example: the PO check calls two tools and turns the answers into flags.
+The nodes don't hold any company data themselves. When they need to know something they call a tool, which here is just
+a small Python function *(notebook §3)*: `find_vendor`, `find_purchase_order`, `find_goods_receipt`, `is_already_paid`,
+`is_valid_gstin_format` and `call_vendor`. The last one is simulated: it returns whatever a fixed script says the vendor
+answered on that attempt, so every run behaves the same way.
+
+Here's the purchase order check, which calls two tools:
 
 ```python
 def check_po_match(state):
     invoice = state["invoice"]
-    po = find_purchase_order(invoice["po_number"])                     # TOOL CALL
+    po = find_purchase_order(invoice["po_number"])                     # tool call
     if po is None or po["vendor_id"] != state["vendor"]["vendor_id"]:
         return report("check_po_match", ["NO_MATCHING_PO"])
     flags = []
     if invoice["amount"] > po["amount"]:
         flags.append("AMOUNT_EXCEEDS_PO")
-    if find_goods_receipt(invoice["po_number"]) is None:               # TOOL CALL
+    if find_goods_receipt(invoice["po_number"]) is None:               # tool call
         flags.append("GOODS_NOT_RECEIVED")
     return report("check_po_match", flags)
 ```
 
-There's a second kind of function calling in this project, where **the LLM** calls a tool. That's covered in Section 10.
+The LLM also uses a tool, in a slightly different way. That's covered in section 10.
 
----
+## 6. Conditional routing
 
-## 6. Conditional routing: who goes where?
-
-A plain edge always goes to the same place. A **conditional edge** asks a **router** function where to go next.
-A router reads the State and **returns the name of the next node**. It **never changes** the State *(Notebook §6)*.
+A normal edge always leads to the same node. A conditional edge calls a router function to decide where to go next.
+Routers read the state and return a node name, and they never change the state themselves *(notebook §6)*.
 
 ```python
 def route_by_score(state):
@@ -279,46 +217,37 @@ def route_by_score(state):
 builder.add_conditional_edges("risk_scorer", route_by_score, ["approve", "callback_vendor", "block"])
 ```
 
-Our three routers:
+The agent has three routers. `route_after_validate` returns `"reject"` for a bad invoice, and otherwise returns the list
+of all four check names. Returning a list is what makes the four checks start together (a fan-out).
+`route_by_score` is the one above. `route_after_call` decides what happens after each phone call, including whether to
+call again.
 
-| Router | After | Returns |
-|---|---|---|
-| `route_after_validate` | `validate` | `"reject"`, **or the list of all 4 checks** (a list = run them in parallel: this is the fan-out) |
-| `route_by_score` | `risk_scorer` | `"approve"` / `"callback_vendor"` / `"block"` |
-| `route_after_call` | `callback_vendor` | `"approve"` / **`"callback_vendor"` (loop)** / `"block"` |
+The opposite of the fan-out is the join: `builder.add_edge(CHECKS, "risk_scorer")`. Passing a list as the start of an
+edge means the scorer waits until every check in the list has finished and then runs once.
 
-**The join:** `builder.add_edge(CHECKS, "risk_scorer")`. Passing a *list* means
-"wait until **all** of these have finished, then run `risk_scorer` once".
+## 7. Loops, and stopping them
 
-> **Check yourself:** What's the difference between a node and a router? *(A node does work and returns a delta. A router only picks the next node.)*
+### Why the agent needs a loop
 
----
-
-## 7. Loops, and how to stop infinite loops ⭐
-
-### 7.1 Why a loop?
-
-Real vendors don't always pick up the phone. Giving up after one missed call would block honest vendors,
-like Patil Plastics (invoice 3), who answers on the **second** call. So the agent **calls again**.
-
-In the graph that's an edge from `callback_vendor` **back to itself**: a **cycle**.
-A cycle is what turns a simple pipeline into an *agent* that can retry.
+Vendors don't always answer the phone. If the agent gave up after one missed call it would block honest suppliers like
+Patil Plastics (invoice 3), who answer the second time. So `callback_vendor` is allowed to route back to itself, which
+puts a cycle in the graph.
 
 ```mermaid
 flowchart LR
-    S[risk_scorer] -->|"score 30 to 79"| C["callback_vendor<br/>call_attempts = call_attempts + 1"]
+    S[risk_scorer] -->|"score 30 to 79"| C["callback_vendor<br/>call_attempts + 1"]
     C --> R{route_after_call}
-    R -->|"no answer AND call_attempts below MAX_CALLS"| C
+    R -->|"no answer, attempts below MAX_CALLS"| C
     R -->|"confirmed"| A[approve]
     R -->|"denied"| B1["block (fraud)"]
-    R -->|"no answer AND call_attempts = MAX_CALLS"| B2["block (unverified)"]
+    R -->|"no answer, attempts = MAX_CALLS"| B2["block (unverified)"]
 ```
 
 ```python
 def callback_vendor(state):
     attempt = state.get("call_attempts", 0) + 1
-    phone = state["vendor"]["phone"]                     # OUR number, never the invoice's
-    answer = call_vendor(phone, attempt)                 # TOOL CALL
+    phone = state["vendor"]["phone"]                     # our number, never the invoice's
+    answer = call_vendor(phone, attempt)
     return {"call_attempts": attempt, "vendor_response": answer,
             "audit_log": [f"callback_vendor: call #{attempt} to {phone} -> {answer}"]}
 
@@ -326,59 +255,53 @@ def route_after_call(state):
     if state["vendor_response"] == "confirmed":
         return "approve"
     if state["vendor_response"] == "no_answer" and state["call_attempts"] < MAX_CALLS:
-        return "callback_vendor"          # LOOP: try again
+        return "callback_vendor"      # try again
     return "block"
 ```
 
-**How does the loop "remember"?** Through the State. Each round, `callback_vendor` returns
-`call_attempts` one higher, and the router reads it. Without State there would be no way to count.
+The loop only works because of the state. Each time round, `callback_vendor` returns a `call_attempts` that is one
+higher, and the router reads it. Without somewhere to store that number there would be no way to count.
 
-### 7.2 The danger: infinite loops
+### The infinite loop problem
 
-Rao Rubber Works (invoice 5) **never** answers. If nothing counted the calls, the agent would phone forever,
-and the program would never finish.
+Rao Rubber Works (invoice 5) never answers. If nothing counted the calls, the agent would keep phoning forever and the
+program would never finish.
 
-### 7.3 Two guards
+There are two safeguards. The first is the `call_attempts < MAX_CALLS` condition in `route_after_call`, with
+`MAX_CALLS = 3`. That's the intended way out: after three unanswered calls the invoice is blocked as unverified.
 
-| Guard | Code | Purpose |
-|---|---|---|
-| **#1 Business rule** | `call_attempts < MAX_CALLS` in `route_after_call` (`MAX_CALLS = 3`) | the **intended** exit: after 3 calls, block as "unverified" |
-| **#2 Safety net** | `graph.invoke(..., config={"recursion_limit": 20})` | LangGraph counts **steps** and raises `GraphRecursionError` past the limit. This catches **bugs**. |
+The second is LangGraph's `recursion_limit`, passed on every run as `config={"recursion_limit": 20}`. LangGraph counts
+steps (supersteps) and raises `GraphRecursionError` if a run goes past the limit. A normal run here takes at most 8 steps
+(`read_invoice`, `validate`, the four checks as one parallel step, `risk_scorer`, three calls and `block`), so 20 never
+gets in the way, but it would stop a loop that a bug had left without an exit.
 
-A normal run needs at most **8 steps**: `read_invoice → validate → 4 checks (1 parallel step) → risk_scorer → call → call → call → block`.
-So a limit of 20 never gets in the way, but still stops a runaway loop.
+### Breaking the first safeguard on purpose
 
-### 7.4 Experiment: break guard #1 on purpose
-
-The notebook builds a tiny graph whose router **forgets** to count *(Notebook §10)*:
+The notebook builds a small graph whose router doesn't count calls at all *(notebook §10)*:
 
 ```python
 def route_after_call_no_guard(state):
-    # no MAX_CALLS check!
+    # no MAX_CALLS check
     return "callback_vendor" if state["vendor_response"] == "no_answer" else END
 ```
 
-Running it on Rao (with a small limit of 6):
+Run against Rao with the limit lowered to 6, it calls until LangGraph stops it:
 
 ```
 callback_vendor: call #1 to +91-90000-10004 -> no_answer
 callback_vendor: call #2 to +91-90000-10004 -> no_answer
 ...
 callback_vendor: call #6 to +91-90000-10004 -> no_answer
-
 GraphRecursionError: Recursion limit of 6 reached without hitting a stop condition.
 ```
 
-> **Lesson:** every cycle needs an exit condition **stored in the State** (guard #1),
-> and every run should still have a **recursion limit** (guard #2) as a seatbelt.
+So any cycle needs an exit condition stored in the state, and it's worth keeping a recursion limit as well in case that
+condition ever breaks.
 
----
+## 8. Tracing the delta
 
-## 8. Tracing the delta, step by step ⭐
-
-**Tracing the delta** means following the agent one node at a time and asking:
-*what did this node change, and what does the State look like now?*
-LangGraph shows this with `graph.stream(..., stream_mode="updates")`, which yields each node's delta as it happens.
+Tracing the delta means following a run one node at a time and asking what each node changed and what the state looks
+like afterwards. `graph.stream(..., stream_mode="updates")` gives you each node's delta as it happens:
 
 ```python
 for update in graph.stream({"raw_text": invoice_text}, stream_mode="updates", config=RUN_CONFIG):
@@ -386,75 +309,66 @@ for update in graph.stream({"raw_text": invoice_text}, stream_mode="updates", co
         print(node_name, delta)
 ```
 
-### Walkthrough: invoice 5 (Rao Rubber Works, bank changed, never answers)
+Here is invoice 5 (Rao Rubber Works: new bank account, vendor never answers). The notebook prints the deltas as a table
+*(notebook §11.3)*; the columns on the right show what the state holds after each step.
 
-The notebook prints this as a table *(Notebook §11.3)*. Here's the same trace, with the important parts of the State **after** each step:
-
-| # | Node | Delta returned (what changed) | `risk_flags` after | `risk_score` | `call_attempts` | Next (and why) |
+| # | Node | Delta returned | `risk_flags` after | `risk_score` | `call_attempts` | Next |
 |-|-----|----------------|-------|---|---|-------|
-| 0 | *(input)* | `raw_text` | – | – | – | `read_invoice` |
-| 1 | `read_invoice` | `invoice: {invoice_no: RRW/0931, …, bank_account: 11223344556}` | – | – | – | `validate` |
-| 2 | `validate` | `vendor: {V004 … bank_account: 20456789012 …}`, `errors: []` | – | – | – | all 4 checks (no errors) |
-| 3 | `check_bank_change` ‖ | `risk_flags: ['BANK_DETAILS_CHANGED']` | | | | |
-| 4 | `check_duplicate` ‖ | `risk_flags: []` | | | | |
-| 5 | `check_gstin` ‖ | `risk_flags: []` | | | | |
-| 6 | `check_po_match` ‖ | `risk_flags: []` | **`['BANK_DETAILS_CHANGED']`** (merged by the reducer) | – | – | `risk_scorer` (join) |
-| 7 | `risk_scorer` | `risk_score: 50` | same | **50** | – | 50 is 30–79 → `callback_vendor` |
-| 8 | `callback_vendor` | `call_attempts: 1`, `vendor_response: no_answer` | same | 50 | **1** | 1 < 3 → **loop** |
-| 9 | `callback_vendor` | `call_attempts: 2`, `vendor_response: no_answer` | same | 50 | **2** | 2 < 3 → **loop** |
-| 10 | `callback_vendor` | `call_attempts: 3`, `vendor_response: no_answer` | same | 50 | **3** | 3 is not < 3 → `block` |
+| 0 | (input) | `raw_text` | - | - | - | `read_invoice` |
+| 1 | `read_invoice` | `invoice: {invoice_no: RRW/0931, …, bank_account: 11223344556}` | - | - | - | `validate` |
+| 2 | `validate` | `vendor: {V004 … bank_account: 20456789012 …}`, `errors: []` | - | - | - | all four checks |
+| 3 | `check_bank_change` | `risk_flags: ['BANK_DETAILS_CHANGED']` | | | | |
+| 4 | `check_duplicate` | `risk_flags: []` | | | | |
+| 5 | `check_gstin` | `risk_flags: []` | | | | |
+| 6 | `check_po_match` | `risk_flags: []` | `['BANK_DETAILS_CHANGED']` (merged) | - | - | `risk_scorer` |
+| 7 | `risk_scorer` | `risk_score: 50` | same | 50 | - | 50 is between 30 and 79, so `callback_vendor` |
+| 8 | `callback_vendor` | `call_attempts: 1`, `vendor_response: no_answer` | same | 50 | 1 | 1 < 3, call again |
+| 9 | `callback_vendor` | `call_attempts: 2`, `vendor_response: no_answer` | same | 50 | 2 | 2 < 3, call again |
+| 10 | `callback_vendor` | `call_attempts: 3`, `vendor_response: no_answer` | same | 50 | 3 | 3 is not < 3, so `block` |
 | 11 | `block` | `decision: BLOCKED`, `reason: could not reach vendor after 3 call(s) - unverified` | same | 50 | 3 | END |
 
-(‖ = these four ran **in parallel**, in the same step. Every row also appended one line to `audit_log`.)
+Rows 3 to 6 ran in parallel, in a single step. Every row also appended one line to `audit_log`.
 
-**Things to notice:**
+Two things are worth noticing. In rows 3 to 6 each check returns its own small list, and the state only holds the merged
+list once all four have finished, which is the reducer at work. In rows 8 to 10 `call_attempts` goes from 1 to 3 and the
+router reads it each time, which is the loop guard at work. Nothing is ever removed from the state: each delta only adds
+to or replaces the keys it names, which is what makes the run easy to audit afterwards.
 
-- Rows 3–6: each check returns its **own small list**; only after all four does the State hold the merged list. That's the **reducer**.
-- Rows 8–10: `call_attempts` goes 1 → 2 → 3, and the router reads it each time. That's the **loop guard**.
-- Nothing is ever deleted; each delta adds to or replaces exactly the keys it names. That's why the trace is **auditable**.
+*Quick check: trace invoice 3 (Patil). The first call gets no answer, so the router loops; the second call is confirmed,
+so the invoice goes to `approve` after two calls.*
 
-> **Check yourself:** Trace invoice 3 (Patil). Which row changes, and what is the final decision?
-> *(Call #1 → no_answer → loop; call #2 → confirmed → `approve`. Final: APPROVED after 2 calls.)*
+## 9. The agent's behaviour
 
----
+The notebook runs all seven test invoices and draws the graph once for each, colouring the path that invoice took
+*(notebook §11.2)*. Green means approved, red blocked, orange rejected.
 
-## 9. The agent's behaviour, in diagrams
-
-The notebook runs all 7 test invoices and draws the **same graph seven times**, colouring the path each one took *(Notebook §11.2)*.
-
-![The path each test invoice took](assets/behaviour_paths.png)
+![Path taken by each test invoice](assets/behaviour_paths.png)
 
 | # | Invoice | Path | Decision |
-|---|---|---|---|
-| 1 | Clean | checks → score 0 → approve | ✅ APPROVED |
-| 2 | Already paid | checks → score 100 → block | ⛔ BLOCKED |
-| 3 | Patil: bank changed, answers on call 2 | score 50 → call → **loop** → call → approve | ✅ APPROVED |
-| 4 | Gupta: bank changed, vendor denies | score 50 → call → block | ⛔ BLOCKED: **fraud caught** |
-| 5 | Rao: bank changed, never answers | score 50 → call → **loop** → **loop** → block | ⛔ BLOCKED |
-| 6 | Fake GSTIN + bank changed | score 90 → block | ⛔ BLOCKED |
-| 7 | PO and amount missing | validate → reject | ❌ REJECTED |
+|-|----------|----------|-----|
+| 1 | clean invoice | checks, score 0, approve | approved |
+| 2 | already paid | checks, score 100, block | blocked |
+| 3 | Patil: new bank, answers on the second call | score 50, call, call again, approve | approved |
+| 4 | Gupta: new bank, vendor denies sending it | score 50, call, block | blocked (fraud) |
+| 5 | Rao: new bank, never answers | score 50, three calls, block | blocked |
+| 6 | fake GSTIN and new bank | score 90, block | blocked |
+| 7 | PO number and amount missing | validate, reject | rejected |
 
-The notebook also checks itself: an `EXPECTED` table lists the decision each invoice *should* get,
-and the summary table has an `as expected` column *(Notebook §8)*. All 7 are `True`.
+The notebook also keeps an `EXPECTED` dictionary with the decision each invoice should get, and the results table
+includes an `as expected` column *(notebook §8)*. All seven come out `True`.
 
----
+## 10. Using the local LLM to read messy invoices
 
-## 10. The local LLM: reading messy invoices safely
+The test invoices use a simple `Label: value` layout that a short parser can read. Real invoices often arrive as emails
+instead:
 
-Our test invoices use a neat `Label: value` template, which a short Python parser reads perfectly.
-Real invoices are often emails:
+> Please find our bill no. SST/2026/0415 … against your order PO-1001. Total payable: Rs. 4,50,000/- …
+> Kindly remit to our HDFC current a/c no. 50100234567.
 
-> *"Please find our bill no. SST/2026/0415 … against your order PO-1001. Total payable: Rs. 4,50,000/- …
-> Kindly remit to our HDFC current a/c no. 50100234567."*
-
-The parser finds **nothing** in this. A **local LLM** (`qwen3:4b-instruct`, running in Ollama on the laptop) can read it.
-
-### 10.1 Function calling with an LLM
-
-1. We write a normal Python function with a docstring, `submit_invoice_fields(invoice_no, vendor, po_number, amount, gstin, bank_account)`.
-   Ollama turns it into a **tool description** the model understands.
-2. We send the invoice text, and the model replies with a **tool call**: the function name plus the arguments it filled in.
-3. **Our** code runs the function with those arguments.
+The parser finds nothing in that. A local model (`qwen3:4b-instruct`, running through Ollama) can read it, using tool
+calling. We write an ordinary Python function, `submit_invoice_fields(invoice_no, vendor, po_number, amount, gstin,
+bank_account)`, and Ollama turns its signature and docstring into a tool description. The model replies with a call to
+that tool, including the arguments it filled in, and our code runs the function with them:
 
 ```python
 response = ollama.chat(model=LLM_MODEL, messages=[...], tools=[submit_invoice_fields],
@@ -464,106 +378,100 @@ for call in response.message.tool_calls or []:
         return submit_invoice_fields(**call.function.arguments)
 ```
 
-### 10.2 Don't trust; verify
-
-When we tested the model on our 7 invoices, it read almost everything right, but it **copied some values wrongly**:
-`PO-1001` became `PO-10_001`, and one digit of a bank account number changed. In a payment system that's dangerous.
-So `read_invoice` works in layers:
+When we tried the model on the seven test invoices, it got most fields right but sometimes copied a value wrongly:
+`PO-1001` came back as `PO-10_001`, and once a bank account had a digit changed. For a payment system that's a real
+risk, so `read_invoice` is set up in layers:
 
 ```mermaid
 flowchart LR
-    T[invoice text] --> P[simple parser]
-    P -->|"all 6 fields"| OUT[invoice fields]
-    P -->|"fields missing and USE_LLM"| L["local LLM<br/>tool call"]
-    L --> V{"value appears<br/>word-for-word<br/>in the text?"}
+    T[invoice text] --> P[parser]
+    P -->|"all six fields found"| OUT[invoice fields]
+    P -->|"fields missing"| L["local LLM<br/>tool call"]
+    L --> V{"value found<br/>in the text?"}
     V -->|yes| OUT
-    V -->|no| X[thrown away]
+    V -->|no| X[dropped]
 ```
 
-- The **parser goes first**; the LLM only fills fields the parser couldn't find.
-- Every LLM value must appear **word-for-word in the invoice text**, or it's thrown away.
-- If Ollama isn't running, the agent **falls back** to the parser and still works.
-- The LLM **never** makes the money decision. **The LLM reads, the rules decide.**
+The parser always goes first, and the LLM is only asked about fields the parser couldn't find. Any value the LLM returns
+is kept only if it appears word for word in the invoice text. If Ollama isn't running, the node uses the parser result
+on its own. The LLM never decides whether an invoice is approved or blocked; that's left to the rules.
 
-Result *(Notebook §12)*: the messy email is **REJECTED** with the parser alone, and **APPROVED** with the LLM.
-It's the same graph and the same rules; only the reading got smarter.
+With this in place, the email above is rejected when only the parser is used and approved once the LLM is switched on,
+using exactly the same checks *(notebook §12)*.
 
-A real debugging story from building this: when the tool description gave `PO-1001` as an *example*, the model kept returning
-`PO-10_01`. The verification rule refused it, so no harm was done. Removing the example fixed it.
-Small wording changes affect LLMs, and that's why we always verify.
+One thing that came up while building it: when the tool description gave `PO-1001` as an example of a PO number, the
+model kept returning `PO-10_01` for the email. The verification step dropped the value, so nothing went wrong, and
+removing the example from the description fixed it. Small changes in wording affect a model's output, which is the main
+reason to check what it returns.
 
----
-
-## 11. Edge cases: what could go wrong, and what the agent does
+## 11. Edge cases
 
 | Situation | What the agent does | Where |
 |---|---|---|
-| Invoice already paid | `DUPLICATE_INVOICE` (100) → block | `check_duplicate` |
-| Bank account differs from our records | `BANK_DETAILS_CHANGED` (50) → call the vendor | `check_bank_change` |
-| Vendor says "we never sent this" | block: *likely fraud* | `route_after_call`, `block` |
-| Vendor never answers | 3 calls, then block: *unverified* | loop guard #1 |
+| invoice already paid | `DUPLICATE_INVOICE` (100), blocked | `check_duplicate` |
+| bank account differs from our records | `BANK_DETAILS_CHANGED` (50), vendor is called | `check_bank_change` |
+| vendor says they never sent it | blocked as likely fraud | `route_after_call`, `block` |
+| vendor never answers | blocked after three calls | loop guard |
 | GSTIN in the wrong format | `INVALID_GSTIN` (40) | `check_gstin` |
-| Valid GSTIN, but another company's | `GSTIN_MISMATCH` (40) | `check_gstin` |
-| No PO, or a PO belonging to a different vendor | `NO_MATCHING_PO` (40) | `check_po_match` |
-| Amount higher than the PO | `AMOUNT_EXCEEDS_PO` (30) | `check_po_match` |
-| Goods not received yet | `GOODS_NOT_RECEIVED` (30) | `check_po_match` |
-| Several problems at once | points add up (e.g. 50 + 40 = 90 → block) | `risk_scorer` |
-| Missing fields | reject, listing what's missing | `validate` → `reject` |
-| Vendor not in our master | reject | `validate` → `reject` |
-| Amount written as `4,50,000` or `Rs. 4,50,000/-` | converted to `450000` | `to_rupees` |
-| LLM copies a value wrongly | value not found in text → thrown away | `read_invoice` |
-| Ollama not running | parser only; agent still works | `read_invoice` |
-| A bug creates a runaway loop | `GraphRecursionError` after 20 steps | loop guard #2 |
-| Two nodes write one key in parallel | needs a reducer, otherwise `InvalidUpdateError` | `PaymentState` |
+| valid GSTIN belonging to another company | `GSTIN_MISMATCH` (40) | `check_gstin` |
+| no PO, or a PO for a different vendor | `NO_MATCHING_PO` (40) | `check_po_match` |
+| amount above the PO | `AMOUNT_EXCEEDS_PO` (30) | `check_po_match` |
+| goods not received yet | `GOODS_NOT_RECEIVED` (30) | `check_po_match` |
+| several problems at once | points add up, e.g. 50 + 40 = 90, blocked | `risk_scorer` |
+| missing fields | rejected, listing what's missing | `validate`, `reject` |
+| vendor not in our records | rejected | `validate`, `reject` |
+| amount written as `4,50,000` or `Rs. 4,50,000/-` | converted to `450000` | `to_rupees` |
+| LLM copies a value wrongly | value not found in the text, so it's dropped | `read_invoice` |
+| Ollama not running | parser result used on its own | `read_invoice` |
+| a bug leaves the loop without an exit | `GraphRecursionError` after 20 steps | `recursion_limit` |
+| two nodes write the same key in parallel | needs a reducer, otherwise `InvalidUpdateError` | `PaymentState` |
 
-**Honest limitations:** phone calls are simulated; data lives in Python dictionaries; a confirmed bank change doesn't yet
-update the vendor master; invoices split into small pieces to stay under limits aren't detected yet.
+Some things are simplified for the prototype: the phone calls are simulated, the company data lives in Python
+dictionaries, a vendor confirming a new bank account doesn't update their record, and an invoice split into smaller
+ones to stay under a limit wouldn't be noticed.
 
----
+## 12. Things to try
 
-## 12. Try it yourself
+All the rules are constants at the top of the notebook *(notebook §1)*, so you can change one, run everything again,
+and see how the routes change.
 
-All the rules are constants at the top of the notebook *(Notebook §1)*. Change one, **Run All**, and watch the paths change.
+1. Set `RISK_POINTS["BANK_DETAILS_CHANGED"] = 80`. Invoices 3, 4 and 5 should now skip the phone call and be blocked
+   straight away.
+2. Set `MAX_CALLS = 1`. Invoice 3 should now be blocked, because Patil only answers on the second call.
+3. Add a fifth check that flags any invoice over ₹3,00,000:
 
-1. **Make bank changes stricter.** Set `RISK_POINTS["BANK_DETAILS_CHANGED"] = 80`.
-   *Prediction:* invoices 3, 4 and 5 skip the call and are blocked straight away.
-2. **Be less patient.** Set `MAX_CALLS = 1`.
-   *Prediction:* invoice 3 (Patil, answers on call 2) is now blocked. Is that good for business?
-3. **Add a fifth check: high-value invoices.** Big payments should always be confirmed.
    ```python
    def check_high_value(state):
        flags = ["HIGH_VALUE"] if state["invoice"]["amount"] > 300000 else []
        return report("check_high_value", flags)
    ```
-   Then: add `"HIGH_VALUE": 30` to `RISK_POINTS`, add `"check_high_value"` to `CHECKS`,
-   add `check_high_value` to the list of functions passed to `builder.add_node` (§7), and give it a spot in `POSITIONS` for the drawing.
-   *Prediction:* invoice 1 (₹4,50,000) now scores 30 and goes to `callback_vendor`. Sharma Steel isn't in
-   `CALLBACK_SCRIPT`, so nobody answers and it's blocked after 3 calls. Add `"+91-90000-10001": ["confirmed"]` to the script
-   and it's approved instead. The fan-out and join work automatically because they use the `CHECKS` list,
-   and the reducer merges the new flag with no other changes.
 
----
+   Add `"HIGH_VALUE": 30` to `RISK_POINTS`, add `"check_high_value"` to `CHECKS`, add the function to the list of nodes
+   in §7, and give it a position in `POSITIONS` so the drawing still works. Invoice 1 (₹4,50,000) should now score 30
+   and go to `callback_vendor`. Sharma Steel isn't in `CALLBACK_SCRIPT`, so nobody answers and it ends up blocked after
+   three calls; adding `"+91-90000-10001": ["confirmed"]` to the script gets it approved. The fan-out and join pick up
+   the new check automatically because they use the `CHECKS` list, and the reducer merges its flag with the others.
 
 ## 13. Glossary
 
 | Term | Meaning |
 |---|---|
-| **Agent** | a program that takes steps towards a goal, using tools and making decisions along the way |
-| **State machine** | a fixed set of states/steps with defined transitions between them |
-| **LangGraph** | a Python library for building agents as graphs of nodes and edges with shared state |
-| **State** | the shared dictionary that travels through the graph (`PaymentState`) |
-| **Node** | a Python function that reads the State and returns a delta |
-| **Delta** | the small dictionary a node returns: only the keys it changed |
-| **Reducer** | the rule for merging a delta into the State (default: replace; `operator.add`: append) |
-| **Edge** | an arrow from one node to the next |
-| **Conditional edge / router** | an edge whose destination is chosen at run time by a router function |
-| **Fan-out / join** | starting several nodes in parallel / waiting for all of them before continuing |
-| **Superstep** | one round of execution; nodes in the same superstep run in parallel, and their deltas are merged at the end |
-| **Cycle / loop** | an edge that leads back to an earlier node (here: `callback_vendor` → itself) |
-| **`recursion_limit`** | the maximum number of supersteps per run; exceeding it raises `GraphRecursionError` |
-| **Tool / function calling** | the agent (or the LLM) calling a function to look something up or act |
-| **Ollama** | software that runs LLMs locally on your own computer |
-| **Deterministic** | same input → same output, every time |
-| **GSTIN** | the 15-character Indian GST registration number |
-| **PO / GRN** | purchase order / goods receipt note (proof of delivery) |
-| **BEC** | Business Email Compromise: fraud using a hacked or spoofed business email |
+| agent | a program that works towards a goal in steps, using tools and making decisions along the way |
+| state machine | a fixed set of steps with defined transitions between them |
+| LangGraph | a Python library for building agents as graphs of nodes and edges with shared state |
+| state | the dictionary passed through the graph (`PaymentState`) |
+| node | a function that reads the state and returns a delta |
+| delta | the dictionary a node returns, containing only the keys it changed |
+| reducer | the rule for merging a delta into the state; replace by default, append with `operator.add` |
+| edge | a connection from one node to the next |
+| conditional edge, router | an edge whose destination is chosen at run time by a router function |
+| fan-out, join | starting several nodes in parallel, and waiting for all of them before continuing |
+| superstep | one round of execution; nodes in the same superstep run in parallel and their deltas are merged at the end |
+| cycle, loop | an edge leading back to an earlier node (here, `callback_vendor` to itself) |
+| `recursion_limit` | the maximum number of supersteps in one run; going past it raises `GraphRecursionError` |
+| tool, function calling | the agent, or the LLM, calling a function to look something up or act |
+| Ollama | software for running language models on your own computer |
+| deterministic | the same input always gives the same output |
+| GSTIN | the 15-character Indian GST registration number |
+| PO, GRN | purchase order, and goods receipt note (proof of delivery) |
+| BEC | business email compromise: fraud using a hacked or imitated business email account |
