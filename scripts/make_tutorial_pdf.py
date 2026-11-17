@@ -1,13 +1,15 @@
-"""Rebuild TUTORIAL.pdf from TUTORIAL.md.
+"""Rebuild a PDF from a Markdown guide (TUTORIAL.md by default).
 
 Markdown -> HTML with pandoc, then HTML -> PDF with Microsoft Edge (headless).
 The Mermaid diagrams are drawn by mermaid.js inside Edge, so this build step needs internet once.
 The agent itself (the notebook) never needs internet.
 
-Usage:  python scripts/make_tutorial_pdf.py
+Usage:  python scripts/make_tutorial_pdf.py                      (TUTORIAL.md -> TUTORIAL.pdf)
+        python scripts/make_tutorial_pdf.py ACCOUNTS_TEAM_GUIDE  (ACCOUNTS_TEAM_GUIDE.md -> .pdf)
 """
 import pathlib
 import subprocess
+import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 EDGE = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
@@ -47,11 +49,12 @@ HEADER = """
 def main():
     header_file = ROOT / "_header.html"
     html_file = ROOT / "_tutorial.html"
-    pdf_file = ROOT / "TUTORIAL.pdf"
+    name = sys.argv[1] if len(sys.argv) > 1 else "TUTORIAL"
+    pdf_file = ROOT / f"{name}.pdf"
     header_file.write_text(HEADER, encoding="utf-8")
     try:
-        subprocess.run(["pandoc", "TUTORIAL.md", "-o", html_file.name, "--standalone",
-                        "--metadata", "pagetitle=Vendor Payment Guard - Tutorial",
+        subprocess.run(["pandoc", f"{name}.md", "-o", html_file.name, "--standalone",
+                        "--metadata", f"pagetitle=Vendor Payment Guard - {name.replace('_', ' ').title()}",
                         "--include-in-header", header_file.name],
                        cwd=ROOT, check=True)
         subprocess.run([EDGE, "--headless", "--disable-gpu", "--no-pdf-header-footer",
